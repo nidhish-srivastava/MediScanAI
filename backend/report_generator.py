@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 LLM_PROVIDER   = "groq"  # hardcoded; Claude commented out
 
 GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL     = "meta-llama/llama-4-scout-17b-16e-instruct"
+GROQ_MODEL     = "qwen/qwen3.6-27b"
 GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
 
 # ── CLAUDE CONFIG (commented out) ─────────────────────────────

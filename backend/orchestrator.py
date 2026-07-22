@@ -17,8 +17,74 @@ from typing import List, Dict, Optional
 
 from cv_model import run_cv_model
 from report_generator import generate_report
+from image_validator import validate_chest_xray
 
 logger = logging.getLogger(__name__)
+
+
+# ── Agent 0: Input Validation ──────────────────────────────────────────────
+
+def run_validation_agent(raw_bytes: bytes) -> Dict:
+    """
+    Heuristic gate: checks whether the uploaded image plausibly looks like a
+    chest X-ray BEFORE running the CV model or spending an LLM call on it.
+    """
+    start = time.time()
+    result = validate_chest_xray(raw_bytes)
+    elapsed = round(time.time() - start, 3)
+
+    if result["is_valid"]:
+        summary = f"Input looks like a chest X-ray (confidence {result['confidence']*100:.0f}%)"
+    else:
+        summary = f"Input rejected — not a chest X-ray ({'; '.join(result['reasons'])})"
+
+    return {
+        "agent": "Input Validation Agent",
+        "status": "complete",
+        "elapsed_seconds": elapsed,
+        "is_valid": result["is_valid"],
+        "confidence": result["confidence"],
+        "reasons": result["reasons"],
+        "checks": result["checks"],
+        "summary": summary,
+    }
+
+
+def _build_rejection_response(validation_result: Dict, patient: Dict, image_meta: Dict, total_elapsed: float) -> Dict:
+    """
+    Short-circuit response returned when the Input Validation Agent rejects
+    the image. Shape stays close to the normal response so the frontend
+    doesn't need a completely separate code path — cv_findings/report/safety
+    are just empty/null, and `rejected: true` + `rejection_reasons` drive the UI.
+    """
+    agent_trace = [
+        {
+            "agent": "Input Validation Agent",
+            "status": "complete",
+            "elapsed_seconds": validation_result["elapsed_seconds"],
+            "summary": validation_result["summary"],
+        },
+        {"agent": "Vision Screening Agent", "status": "skipped", "elapsed_seconds": 0, "summary": "Skipped — input rejected"},
+        {"agent": "Radiologist Agent", "status": "skipped", "elapsed_seconds": 0, "summary": "Skipped — input rejected"},
+        {"agent": "Safety Validation Agent", "status": "skipped", "elapsed_seconds": 0, "summary": "Skipped — input rejected"},
+    ]
+
+    return {
+        "rejected": True,
+        "rejection_reasons": validation_result["reasons"],
+        "cv_findings": [],
+        "report": None,
+        "patient": patient,
+        "safety": {"overrides": [], "flags_checked": [], "urgent_validated": False},
+        "agent_trace": agent_trace,
+        "timing": {
+            "vision_seconds": 0,
+            "radiologist_seconds": 0,
+            "safety_seconds": 0,
+            "total_seconds": round(total_elapsed, 2),
+        },
+        "image_meta": image_meta,
+    }
 
 
 # ── Agent 1: Vision Screening ──────────────────────────────────────────────
@@ -182,9 +248,22 @@ def run_formatting_agent(
         },
     ]
 
+    # Layer-2 check: heuristic gate passed, but the vision LLM itself may still
+    # determine on direct visual inspection that this isn't a real chest X-ray.
+    # We don't hard-block here (the report call already cost money/time) — instead
+    # we surface it clearly so the frontend can show a prominent warning banner.
+    validity_warning = None
+    if report.get("is_valid_xray") is False:
+        validity_warning = (
+            f"The radiologist agent flagged this image as not a valid chest X-ray on direct "
+            f"visual inspection: {report.get('validity_reason') or 'reason not specified'}. "
+            f"Treat the report below as unreliable."
+        )
+
     return {
         "cv_findings": vision_result["findings"],
         "report": report,
+        "validity_warning": validity_warning,
         "patient": patient,
         "safety": {
             "overrides": safety_result["overrides"],
@@ -216,6 +295,15 @@ async def run_pipeline(
     Called by main.py /analyze endpoint.
     """
     total_start = time.time()
+
+    logger.info("── Agent 0: Input Validation ──")
+    validation_result = run_validation_agent(raw_bytes)
+    logger.info(f"Agent 0 done — {validation_result['summary']}")
+
+    if not validation_result["is_valid"]:
+        total_elapsed = time.time() - total_start
+        logger.warning(f"Pipeline short-circuited — input rejected in {total_elapsed:.2f}s")
+        return _build_rejection_response(validation_result, patient, image_meta, total_elapsed)
 
     logger.info("── Agent 1: Vision Screening ──")
     vision_result = run_vision_agent(raw_bytes)
